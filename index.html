@@ -281,6 +281,10 @@ table.bal tr.now td:last-child{border-radius:0 10px 10px 0}
 .drop{border:2px dashed var(--border2);border-radius:16px;padding:28px 14px;text-align:center;color:var(--muted);font-weight:700;font-size:.86rem;background:var(--card2)}
 .drop input{display:none}
 
+/* Backup nag */
+.nag{display:flex;align-items:center;gap:10px;background:var(--accent-soft);border:1px solid var(--border2);border-radius:14px;padding:11px 13px;font-size:.85rem}
+.nag .note{margin-top:1px}
+
 /* Custom categories */
 .newcat{display:flex;gap:7px;margin-top:7px}
 .newcat .input{flex:1;min-width:0}
@@ -382,7 +386,7 @@ let ui = { tab:'home', selectedAcct:null, timeFilter:'month', catFilter:'', show
 function load(){ try { const raw = localStorage.getItem(KEY); return raw ? JSON.parse(raw) : null; } catch { return null; } }
 function save(){ try { localStorage.setItem(KEY, JSON.stringify(S)); } catch(e){ toast('Could not save — storage full?','error'); } }
 function freshState(name, cur){
-  return { settings:{ appName:name, baseCurrency:cur, rates:{...RATES_USD_DEFAULT}, customCats:[] },
+  return { settings:{ appName:name, baseCurrency:cur, rates:{...RATES_USD_DEFAULT}, customCats:[], firstOpen:todayStr(), lastBackup:null, backupSnooze:null },
            accounts:[], entries:[], transfers:[], budgets:[], goals:[], subs:[], seq:1 };
 }
 const uid = () => S.seq++;
@@ -479,6 +483,41 @@ function processDueSubs(){
     }
   }
   if (posted){ save(); toast(`${posted} recurring payment${posted>1?'s':''} added automatically`, 'success'); }
+}
+
+/* ── backup: monthly reminder + one-tap share ── */
+const DAY_MS = 86400000;
+function needsBackupNag(){
+  if (!S.entries.length) return false;
+  const now = Date.now();
+  if (S.settings.backupSnooze && now < S.settings.backupSnooze) return false;
+  if (S.settings.lastBackup) return now - S.settings.lastBackup > 30 * DAY_MS;
+  const first = new Date((S.settings.firstOpen || todayStr()) + 'T00:00:00').getTime();
+  return now - first > 7 * DAY_MS;   // never backed up: remind after a week of use
+}
+async function doBackup(){
+  const json = JSON.stringify(S, null, 1);
+  const name = `${S.settings.appName.replace(/\s+/g,'-').toLowerCase()}-backup-${todayStr()}.json`;
+  let shared = false;
+  try {
+    const file = new File([json], name, { type:'application/json' });
+    if (navigator.canShare && navigator.canShare({ files:[file] })) {
+      await navigator.share({ files:[file], title:name });
+      shared = true;
+    }
+  } catch (e) { if (e && e.name === 'AbortError') return; }
+  if (!shared){
+    try {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([json], { type:'application/json' }));
+      a.download = name; a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    } catch { return toast('Could not create backup file', 'error'); }
+  }
+  S.settings.lastBackup = Date.now();
+  S.settings.backupSnooze = null;
+  save(); renderHome();
+  toast(shared ? 'Backup shared — keep it somewhere safe 💗' : 'Backup downloaded 💗', 'success');
 }
 
 /* budget alert check after adding an expense (exact port) */
@@ -603,6 +642,10 @@ function renderHome(){
   const hasAny = S.entries.length > 0;
 
   let h = alerts.map(a => `<div class="alert">${ic('alert',16)}<span><strong>${esc(a.category)}</strong> is at ${Math.round(a.percent)}% of your ${esc(fmt0(a.monthly_limit))} budget</span></div>`).join('');
+
+  if (needsBackupNag()) h += `<div class="nag">💾<div style="flex:1;min-width:0"><strong>Quick backup?</strong><div class="note">One tap keeps your data safe.</div></div>
+    <button class="btn btn-primary btn-sm" data-a="backup">Back up</button>
+    <button class="btn btn-soft btn-sm" data-a="backup-later">Later</button></div>`;
 
   h += `<div class="hero">
     <div class="lbl">Total Balance</div>
@@ -1064,7 +1107,7 @@ function settingsSheet(){
     <div class="hint-card" style="margin-bottom:12px"><strong>💾 Keep your data safe</strong><br>
       Everything lives inside this browser on this phone. Make a backup file once in a while — if you ever change phones or clear the browser, Restore brings it all back.</div>
     <div class="fpair" style="margin-bottom:16px">
-      <button class="btn btn-soft" data-a="backup">${ic('download',14)} Backup</button>
+      <button class="btn btn-soft" data-a="backup">${ic('download',14)} Share backup</button>
       <button class="btn btn-soft" data-a="restore">${ic('upload',14)} Restore</button>
     </div>
     <input type="file" id="s-restore-file" accept=".json,application/json" hidden>
@@ -1240,13 +1283,11 @@ const actions = {
     } else toast('Settings saved', 'success');
     save(); closeSheet(); renderAll();
   },
-  'backup': () => {
-    const blob = new Blob([JSON.stringify(S, null, 1)], { type:'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `${S.settings.appName.replace(/\s+/g,'-').toLowerCase()}-backup-${todayStr()}.json`;
-    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-    toast('Backup downloaded', 'success');
+  'backup': () => doBackup(),
+  'backup-later': () => {
+    S.settings.backupSnooze = Date.now() + 7 * DAY_MS;
+    save(); renderHome();
+    toast("I'll remind you in a week", 'info');
   },
   'restore': () => {
     const inp = $('#s-restore-file');
@@ -1259,6 +1300,7 @@ const actions = {
           if (!data.settings || !Array.isArray(data.entries)) throw new Error('bad');
           for (const k of ['accounts','entries','transfers','budgets','goals','subs']) data[k] ||= [];
           data.settings.customCats ||= []; data.settings.rates ||= {...RATES_USD_DEFAULT};
+          data.settings.firstOpen ||= todayStr(); data.settings.lastBackup ??= Date.now(); data.settings.backupSnooze ??= null;
           if (!data.seq) data.seq = 1 + Math.max(0, ...['accounts','entries','transfers','budgets','goals','subs'].flatMap(k => data[k].map(x => x.id || 0)));
           S = data; save(); closeSheet(); renderAll();
           toast('Data restored! 💗', 'success');
@@ -1485,6 +1527,7 @@ function csvImport(){
     return;
   }
   S.settings.customCats ||= [];   // migrate saves from before custom categories
+  S.settings.firstOpen ||= todayStr(); S.settings.lastBackup ??= null; S.settings.backupSnooze ??= null;
   $('#app').hidden = false;
   processDueSubs();
   renderAll();
